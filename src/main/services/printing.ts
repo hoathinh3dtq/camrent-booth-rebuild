@@ -1,5 +1,4 @@
-// Printing — compose SVG template với ảnh phiên chụp, in qua OS print của Electron.
-import { BrowserWindow } from 'electron'
+// Printing — compose SVG template; in thật qua pipeline GDI (xem print-gdi.ts).
 import { getDb, getSetting } from '../db'
 
 export interface TemplateDef {
@@ -89,22 +88,5 @@ function escapeXml(s: string): string {
   return s.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]!))
 }
 
-export async function printComposed(dataUrl: string, printerName?: string | null): Promise<void> {
-  // Cửa sổ in ẩn — webContents.print() của Electron (silent khi có tên máy in).
-  const win = new BrowserWindow({
-    show: false,
-    webPreferences: { offscreen: false, sandbox: true },
-  })
-  const html = `<!doctype html><html><head><meta charset="utf-8"><style>@page { margin: 0; } body { margin: 0; } img { width: 100vw; height: 100vh; object-fit: contain; }</style></head><body><img src="${dataUrl}"></body></html>`
-  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
-  await new Promise<void>((resolve, reject) => {
-    win.webContents.print(
-      { silent: !!printerName, deviceName: printerName ?? undefined, printBackground: true },
-      (success, failureReason) => {
-        win.close()
-        if (success) resolve()
-        else reject(new Error(failureReason || 'In thất bại'))
-      },
-    )
-  })
-}
+// composeLayout giữ nguyên; in thật đi qua pipeline GDI (print-gdi.ts) — webContents.print() không đặt được DEVMODE/paper cho DNP.
+

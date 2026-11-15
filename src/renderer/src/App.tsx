@@ -12,6 +12,7 @@ const IPC = {
   GALLERY_LIST_SESSIONS: 'gallery:listSessions',
   TEMPLATES_LIST: 'templates:list',
   PRINTER_LIST_PRINTERS: 'printer:listPrinters',
+  PRINTER_PROBE_DNP: 'printer:probeDnp',
   PRINTER_DETECT_DNP: 'printer:detectDnp',
   CAMERA_SET_MOCK: 'camera:setMock',
   PRINTER_DRY_RUN: 'printer:dryRun',
@@ -357,6 +358,7 @@ function Admin() {
   const [cfg, setCfg] = useState<any>(null)
   const [printers, setPrinters] = useState<any[]>([])
   const [dnp, setDnp] = useState<{ name: string; displayName: string }[] | null>(null)
+  const [probe, setProbe] = useState<any>(null)
   const [camStatus, setCamStatus] = useState<string>('')
   const [saved, setSaved] = useState(false)
 
@@ -369,6 +371,19 @@ function Admin() {
   useEffect(() => {
     refresh()
   }, [])
+
+  const probeDnp = async () => {
+    setProbe(await window.booth.invoke(IPC.PRINTER_PROBE_DNP))
+  }
+
+  const testPrint = async (templateId: 'classic4' | 'strip4') => {
+    try {
+      const r = await window.booth.invoke(IPC.PRINTER_PRINT, { templateId, photos: [], copies: 1 })
+      setProbe({ ...(probe ?? {}), testResult: `✓ ${templateId}: ${r?.detail ?? 'đã gửi lệnh in'} → máy ${r?.printer ?? 'mặc định'}` })
+    } catch (e: any) {
+      setProbe({ ...(probe ?? {}), testResult: `✗ Lỗi: ${String(e?.message ?? e)}` })
+    }
+  }
 
   const detectDnp = async () => {
     const found = await window.booth.invoke(IPC.PRINTER_DETECT_DNP)
@@ -435,7 +450,30 @@ function Admin() {
                 ))}
               </div>
             ))}
-            <div className="mt-2 text-xs text-white/50">Khuyến nghị: tạo 2 queue Windows riêng — "CamRent 4×6" (khổ 288×432, cắt 1 tờ) và "CamRent Strip 2×6" (PageSize w288h432-div2 hoặc Cutter=2Inch trên giấy 4×6) — rồi gán bên dưới.</div>
+            <div className="mt-2 text-xs text-white/50">App tự chọn khổ giấy theo template (4×6 / strip 2×6). Không cần tạo queue riêng — bấm "Dò khổ giấy" để xem máy sẽ in khổ nào.</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button className="btn-ghost !px-4 !py-2 !text-sm" onClick={probeDnp}>Dò khổ giấy</button>
+              <button className="btn-ghost !px-4 !py-2 !text-sm" onClick={() => testPrint('classic4')}>In thử 4×6</button>
+              <button className="btn-ghost !px-4 !py-2 !text-sm" onClick={() => testPrint('strip4')}>In thử strip 2×6</button>
+            </div>
+            {probe && (
+              <div className="mt-2 space-y-1 rounded-lg border border-white/10 bg-black/30 p-2 text-xs">
+                <div className="text-white/80">{probe.detail}</div>
+                {probe.willPrint4x6 && <div className="text-emerald-300">✓ 4×6 → khổ: {probe.willPrint4x6}</div>}
+                {probe.willPrint2x6 && <div className="text-emerald-300">✓ 2×6 (strip) → khổ: {probe.willPrint2x6}{probe.cutSupported ? ' (CUT_2INCH)' : ''}</div>}
+                {probe.papers?.length > 0 && (
+                  <details>
+                    <summary className="cursor-pointer text-white/50">{probe.papers.length} khổ giấy phát hiện</summary>
+                    <ul className="mt-1 max-h-40 overflow-y-auto">
+                      {probe.papers.map((p: any) => (
+                        <li key={p.name} className="text-white/60">{p.name} — {p.width}×{p.height} {p.classify === '4x6' ? '· 4×6' : p.classify === '4x6-split' ? '· 4×6-split (2×6)' : ''}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+                {probe.testResult && <div className={probe.testResult.startsWith('✓') ? 'text-emerald-300' : 'text-red-300'}>{probe.testResult}</div>}
+              </div>
+            )}
             <div className="mt-2 grid grid-cols-2 gap-2">
               {(['classic4', 'strip4'] as const).map((t) => (
                 <label key={t} className="text-xs text-white/60">Queue cho {t}

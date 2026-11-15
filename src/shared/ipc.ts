@@ -17,6 +17,7 @@ export const IPC = {
   TEMPLATES_GET: 'templates:get',
   PRINTER_LIST_PRINTERS: 'printer:listPrinters',
   PRINTER_DETECT_DNP: 'printer:detectDnp',
+  PRINTER_PROBE_DNP: 'printer:probeDnp',
   PRINTER_COMPOSE_LAYOUT: 'printer:composeLayout',
   PRINTER_PRINT: 'printer:print',
   PRINTER_GET_CONFIG: 'printer:getConfig',

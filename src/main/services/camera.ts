@@ -1,8 +1,6 @@
-// Camera service — driver resolution:
-//   'auto'    = tự dò gphoto2, thấy máy → gphoto2, không thấy → mock (mặc định)
-//   'mock'    = ảnh giả lập
-//   'gphoto2' = bắt buộc gphoto2 (báo lỗi rõ nếu không thấy binary/máy)
-// gphoto2 bundle đi kèm trong resources/camera-runtime/win32-x64 (copy từ bản gốc công ty).
+// Camera service — 'auto' tự dò gphoto2, 'mock' ảnh giả, 'gphoto2' bắt buộc máy thật.
+// HDMI (Canon R50 style): giữ USB live view = HDMI luôn sáng khi output = TFT + PC.
+// Lúc startLiveView (gphoto2) app tự dò và set cấu hình output, y cơ chế bản gốc.
 
 import { EventEmitter } from 'node:events'
 import { execFile } from 'node:child_process'
@@ -12,6 +10,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { app } from 'electron'
 import { getSetting, setSetting } from '../db'
+import { ensureHdmiOutput, type HdmiSetupResult } from './hdmi'
 
 const execFileAsync = promisify(execFile)
 
@@ -23,6 +22,7 @@ export interface CameraStatus {
   connected: boolean
   detail: string
   gphoto2Path?: string | null
+  hdmi?: HdmiSetupResult | null
 }
 
 export function findGphoto2(): string | null {
@@ -80,6 +80,7 @@ class Gphoto2Camera extends EventEmitter {
   private previewTimer: NodeJS.Timeout | null = null
   private capturing = false
   private detected: boolean | null = null
+  private hdmi: HdmiSetupResult | null = null
 
   constructor() {
     super()
@@ -92,13 +93,18 @@ class Gphoto2Camera extends EventEmitter {
 
   invalidateCache(): void {
     this.detected = null
+    this.hdmi = null
   }
 
-  async status(): Promise<{ connected: boolean; detail: string; bin: string | null }> {
+  getHdmi(): HdmiSetupResult | null {
+    return this.hdmi
+  }
+
+  async status(): Promise<{ connected: boolean; detail: string; bin: string | null; hdmi: HdmiSetupResult | null }> {
     const bin = this.getBin()
     if (!bin) {
       this.detected = false
-      return { connected: false, detail: 'Không tìm thấy gphoto2.exe trong app (resources/camera-runtime) hoặc PATH', bin: null }
+      return { connected: false, detail: 'Không tìm thấy gphoto2.exe trong app (resources/camera-runtime) hoặc PATH', bin: null, hdmi: null }
     }
     try {
       const { stdout } = await execFileAsync(bin, ['--auto-detect'], { timeout: 10000, maxBuffer: 1024 * 1024 })
@@ -109,15 +115,24 @@ class Gphoto2Camera extends EventEmitter {
         connected: cameras.length > 0,
         detail: cameras.length > 0 ? `Đã kết nối: ${cameras[0]}` : 'gphoto2 chạy nhưng chưa thấy máy ảnh qua USB',
         bin,
+        hdmi: this.hdmi,
       }
     } catch (err: any) {
       this.detected = false
-      return { connected: false, detail: `gphoto2 lỗi: ${String(err?.message ?? err).slice(0, 300)}`, bin }
+      return { connected: false, detail: `gphoto2 lỗi: ${String(err?.message ?? err).slice(0, 300)}`, bin, hdmi: null }
     }
   }
 
-  startLiveView(): void {
+  async startLiveView(): Promise<void> {
     if (this.previewTimer) return
+    // Dò & đặt output = TFT + PC (giống bản gốc) — không được thì cảnh báo, app vẫn chạy
+    try {
+      this.hdmi = await ensureHdmiOutput(this.getBin())
+      console.info('[hdmi]', this.hdmi.detail)
+    } catch (err) {
+      this.hdmi = { supported: false, applied: false, detail: String(err) }
+      console.warn('[hdmi] ensure failed:', this.hdmi.detail)
+    }
     this.previewTimer = setInterval(() => {
       if (this.capturing) return
       this.grabPreview().catch(() => { /* bỏ frame lỗi */ })
@@ -206,7 +221,6 @@ export class CameraService extends EventEmitter {
     const setting = this.getDriverSetting()
     if (setting === 'mock') return 'mock'
     if (setting === 'gphoto2') return 'gphoto2'
-    // auto — dò 1 lần, cache lại; "Kiểm tra camera" trong Admin sẽ dò lại
     if (this.effectiveCache) return this.effectiveCache
     if (!this.resolving) {
       this.resolving = (async () => {
@@ -221,14 +235,14 @@ export class CameraService extends EventEmitter {
   async getStatus(): Promise<CameraStatus> {
     const setting = this.getDriverSetting()
     if (setting === 'mock') {
-      return { driver: setting, effective: 'mock', connected: true, detail: 'Mock camera — ảnh giả lập' }
+      return { driver: setting, effective: 'mock', connected: true, detail: 'Mock camera — ảnh giả lập', hdmi: null }
     }
     if (setting === 'gphoto2') {
       const s = await this.gphoto.status()
       if (!s.connected) throw new Error(`gphoto2 chưa sẵn sàng: ${s.detail}`)
-      return { driver: setting, effective: 'gphoto2', connected: true, detail: s.detail, gphoto2Path: s.bin }
+      return { driver: setting, effective: 'gphoto2', connected: true, detail: s.detail, gphoto2Path: s.bin, hdmi: s.hdmi }
     }
-    // auto
+    // auto — dò lại mỗi lần hỏi
     this.effectiveCache = null
     this.gphoto.invalidateCache()
     const s = await this.gphoto.status()
@@ -237,14 +251,17 @@ export class CameraService extends EventEmitter {
       driver: 'auto',
       effective: this.effectiveCache,
       connected: true,
-      detail: s.connected ? s.detail + ' (tự nhận theo USB)' : 'Không thấy camera — đang dùng mock. Cắm máy, bật nguồn, rồi bấm "Kiểm tra camera".',
+      detail: s.connected
+        ? s.detail + ' (tự nhận theo USB)' + (s.hdmi ? ` · HDMI: ${s.hdmi.detail}` : '')
+        : 'Không thấy camera — đang dùng mock. Cắm máy, bật nguồn, rồi bấm "Kiểm tra camera".',
       gphoto2Path: s.bin,
+      hdmi: s.hdmi,
     }
   }
 
   async startLiveView(): Promise<void> {
     const effective = await this.resolveEffective()
-    if (effective === 'gphoto2') this.gphoto.startLiveView()
+    if (effective === 'gphoto2') await this.gphoto.startLiveView()
     else this.mock.startLiveView()
   }
 
@@ -257,7 +274,6 @@ export class CameraService extends EventEmitter {
     const effective = await this.resolveEffective()
     if (effective === 'gphoto2') return this.gphoto.capture()
     if (this.getDriverSetting() === 'gphoto2') {
-      // gphoto2 bắt buộc nhưng chưa kết nối — lỗi rõ ràng
       const s = await this.gphoto.status()
       throw new Error(`Không chụp được: ${s.detail}`)
     }

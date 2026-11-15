@@ -6,6 +6,8 @@ import { CameraService } from './services/camera'
 import * as sessions from './services/sessions'
 import * as printing from './services/printing'
 import * as sharing from './services/sharing'
+import { printGdi, rasterizeToPng, listPrinterPapers, classifyForPapers, type DnpPaper } from './services/print-gdi'
+import fs from 'node:fs'
 
 const camera = new CameraService()
 let mainWindow: BrowserWindow | null = null
@@ -104,12 +106,46 @@ ipcMain.handle(IPC.PRINTER_DETECT_DNP, async () => {
 })
 ipcMain.handle(IPC.PRINTER_COMPOSE_LAYOUT, (_e, arg: { templateId: string; photos: string[] }) =>
   printing.composeLayout(arg.templateId, arg.photos))
+ipcMain.handle(IPC.PRINTER_PROBE_DNP, async () => {
+  const printers = (await mainWindow?.webContents.getPrintersAsync()) ?? []
+  const dnp = printing.detectDnpPrinters(printers)
+  const pick = dnp[0] ?? (printers[0] ? { name: printers[0].name, displayName: printers[0].displayName } : null)
+  if (!pick) return { connected: false, printer: null, papers: [], willPrint4x6: null, willPrint2x6: null, cutSupported: false, detail: 'Không tìm thấy máy in nào' }
+  try {
+    const papers = await listPrinterPapers(pick.name)
+    const cls = classifyForPapers(papers)
+    return {
+      connected: dnp.length > 0,
+      printer: pick.name,
+      papers,
+      willPrint4x6: cls.fourSix,
+      willPrint2x6: cls.twoSix,
+      cutSupported: cls.cutSupported,
+      detail: dnp.length > 0 ? `DNP: ${pick.displayName} (${papers.length} khổ)` : `Không thấy DNP; dùng ${pick.displayName} (${papers.length} khổ)`,
+    }
+  } catch (err: any) {
+    return { connected: dnp.length > 0, printer: pick.name, papers: [], willPrint4x6: null, willPrint2x6: null, cutSupported: false, detail: `Không đọc được khổ giấy: ${String(err?.message ?? err).slice(0, 300)}` }
+  }
+})
 ipcMain.handle(IPC.PRINTER_PRINT, async (_e, arg: { templateId: string; photos: string[]; printerName?: string | null; copies?: number; sessionId?: string | null }) => {
   const composed = printing.composeLayout(arg.templateId, arg.photos)
   const resolved = printing.resolvePrinterForTemplate(arg.templateId, arg.printerName)
-  await printing.printComposed(composed, resolved)
-  sessions.recordPrintJob(arg.sessionId ?? null, arg.templateId, arg.copies ?? 1, resolved ?? null)
-  return { ok: true, printer: resolved }
+  const t = printing.getTemplate(arg.templateId)
+  const paper: DnpPaper = t?.kind === 'strip' ? '2x6' : '4x6'
+  const width = t?.width ?? 1800
+  const height = t?.height ?? 1200
+  const pngPath = await rasterizeToPng(composed, width, height)
+  const copies = Math.max(1, Math.floor(arg.copies ?? 1))
+  let lastLine = ''
+  try {
+    for (let i = 0; i < copies; i++) {
+      lastLine = await printGdi(pngPath, resolved, paper)
+    }
+  } finally {
+    try { fs.unlinkSync(pngPath) } catch { /* ignore */ }
+  }
+  sessions.recordPrintJob(arg.sessionId ?? null, arg.templateId, copies, resolved ?? null)
+  return { ok: true, printer: resolved, paper, detail: lastLine }
 })
 ipcMain.handle(IPC.PRINTER_DRY_RUN, (_e, arg: { templateId: string; photos: string[] }) => {
   const composed = printing.composeLayout(arg.templateId, arg.photos)
