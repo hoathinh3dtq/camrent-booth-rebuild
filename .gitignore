@@ -1,0 +1,19 @@
+# Dependencies / build outputs
+node_modules/
+out/
+dist/
+
+# Native camera runtime (bản phân phối — copy thủ công, xem README)
+resources/camera-runtime/
+
+# Logs & temp
+smoke*.log
+*.log
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Test/rebuild scratch
+_*.cjs
+_*.js
