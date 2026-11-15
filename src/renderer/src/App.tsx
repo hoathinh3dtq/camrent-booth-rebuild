@@ -380,13 +380,13 @@ function Admin() {
 
   const checkCamera = async () => {
     const s = await window.booth.invoke('camera:status')
-    setCamStatus(`${s.driver}: ${s.connected ? '✓' : '✗'} ${s.detail}`)
+    setCamStatus(`${s.effective ?? s.driver}: ${s.connected ? '✓' : '✗'} ${s.detail}`)
   }
 
   const setDriver = async (driver: string) => {
     const s = await window.booth.invoke(IPC.CAMERA_SET_MOCK, { driver })
     setCfg({ ...cfg, cameraDriver: driver })
-    setCamStatus(`${s.driver}: ${s.connected ? '✓' : '✗'} ${s.detail}`)
+    setCamStatus(`${s.effective ?? s.driver}: ${s.connected ? '✓' : '✗'} ${s.detail}`)
   }
 
   const save = async () => {
@@ -451,9 +451,9 @@ function Admin() {
         <div className="card">
           <h3 className="mb-2 text-xl font-semibold">Camera</h3>
           <div className="flex gap-2">
-            {(['mock', 'gphoto2'] as const).map((d) => (
+            {([['auto', 'Tự nhận'], ['mock', 'Mock'], ['gphoto2', 'gphoto2']] as const).map(([d, label]) => (
               <button key={d} className={`btn-ghost !py-2 !text-base flex-1 ${cfg.cameraDriver === d ? '!border-amber-400 !text-amber-300' : ''}`} onClick={() => setDriver(d)}>
-                {d === 'mock' ? 'Mock (ảnh giả)' : 'gphoto2 (máy thật)'}
+                {label}
               </button>
             ))}
           </div>

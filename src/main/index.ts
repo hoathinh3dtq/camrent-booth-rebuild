@@ -48,14 +48,20 @@ function send(channel: string, payload?: unknown): void {
 
 camera.on('frame', (frame: string) => send(IPC.CAMERA_LIVE_VIEW_FRAME, frame))
 
-ipcMain.handle(IPC.CAMERA_STATUS, () => camera.getStatus())
-ipcMain.handle(IPC.CAMERA_GET_MOCK, () => ({ driver: camera.getDriver() }))
+ipcMain.handle(IPC.CAMERA_STATUS, async () => {
+  try {
+    return await camera.getStatus()
+  } catch (err: any) {
+    return { driver: camera.getDriverSetting(), effective: 'gphoto2', connected: false, detail: String(err?.message ?? err) }
+  }
+})
+ipcMain.handle(IPC.CAMERA_GET_MOCK, () => ({ driver: camera.getDriverSetting() }))
 ipcMain.handle(IPC.CAMERA_SET_MOCK, (_e, v: { driver: string }) => {
-  if (v?.driver === 'mock' || v?.driver === 'gphoto2') camera.setDriver(v.driver)
+  if (v?.driver === 'auto' || v?.driver === 'mock' || v?.driver === 'gphoto2') camera.setDriver(v.driver as 'auto' | 'mock' | 'gphoto2')
   return camera.getStatus()
 })
-ipcMain.handle(IPC.CAMERA_START_LIVE_VIEW, () => {
-  camera.startLiveView()
+ipcMain.handle(IPC.CAMERA_START_LIVE_VIEW, async () => {
+  await camera.startLiveView()
   return { ok: true }
 })
 ipcMain.handle(IPC.CAMERA_STOP_LIVE_VIEW, () => {

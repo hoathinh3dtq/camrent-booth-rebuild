@@ -1,11 +1,8 @@
-// Camera service — driver mock (mặc định) hoặc gphoto2 thật (camera Fuji/Canon không qua EDSDK).
-// Cơ chế bám bản gốc (đã phân tích từ app.asar):
-//   gphoto2 --capture-image-and-download --filename <tmp> --force-overwrite  (timeout 30s)
-//   gphoto2 --capture-preview                                            (live view)
-//   --set-config /main/settings/...                                      (settings, Phase 2 đầy đủ)
-// gphoto2 trên Windows cần bundle libgphoto2 (bản gốc ship camera-runtime/win32-x64).
-// Binary tìm theo thứ tự: setting gphoto2Path → biến môi trường CAMRENT_GPHOTO2_PATH
-//   → <resources>/camera-runtime/win32-x64/bin/gphoto2.exe → cạnh app → PATH.
+// Camera service — driver resolution:
+//   'auto'    = tự dò gphoto2, thấy máy → gphoto2, không thấy → mock (mặc định)
+//   'mock'    = ảnh giả lập
+//   'gphoto2' = bắt buộc gphoto2 (báo lỗi rõ nếu không thấy binary/máy)
+// gphoto2 bundle đi kèm trong resources/camera-runtime/win32-x64 (copy từ bản gốc công ty).
 
 import { EventEmitter } from 'node:events'
 import { execFile } from 'node:child_process'
@@ -18,10 +15,11 @@ import { getSetting, setSetting } from '../db'
 
 const execFileAsync = promisify(execFile)
 
-export type CameraDriver = 'mock' | 'gphoto2'
+export type CameraDriverSetting = 'auto' | 'mock' | 'gphoto2'
 
 export interface CameraStatus {
-  driver: CameraDriver
+  driver: CameraDriverSetting
+  effective: 'mock' | 'gphoto2'
   connected: boolean
   detail: string
   gphoto2Path?: string | null
@@ -34,10 +32,8 @@ export function findGphoto2(): string | null {
   if (process.env.CAMRENT_GPHOTO2_PATH) candidates.push(process.env.CAMRENT_GPHOTO2_PATH)
   if (process.resourcesPath) {
     candidates.push(path.join(process.resourcesPath, 'camera-runtime', 'win32-x64', 'bin', 'gphoto2.exe'))
-    candidates.push(path.join(process.resourcesPath, 'camera-runtime', 'win32-x64', 'bin', 'gphoto2'))
   }
   candidates.push(path.join(path.dirname(app.getPath('exe')), 'camera-runtime', 'win32-x64', 'bin', 'gphoto2.exe'))
-  // PATH lookup (không spawn shell)
   for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
     if (!dir) continue
     candidates.push(path.join(dir, 'gphoto2.exe'), path.join(dir, 'gphoto2'))
@@ -83,40 +79,48 @@ class Gphoto2Camera extends EventEmitter {
   private bin: string | null = null
   private previewTimer: NodeJS.Timeout | null = null
   private capturing = false
+  private detected: boolean | null = null
 
   constructor() {
     super()
-    this.bin = findGphoto2()
   }
 
   getBin(): string | null {
-    this.bin = this.bin ?? findGphoto2()
+    if (!this.bin) this.bin = findGphoto2()
     return this.bin
   }
 
-  async status(): Promise<CameraStatus> {
+  invalidateCache(): void {
+    this.detected = null
+  }
+
+  async status(): Promise<{ connected: boolean; detail: string; bin: string | null }> {
     const bin = this.getBin()
     if (!bin) {
-      return { driver: 'gphoto2', connected: false, detail: 'Không tìm thấy gphoto2.exe — cài bundle camera-runtime hoặc đặt gphoto2Path trong Admin', gphoto2Path: null }
+      this.detected = false
+      return { connected: false, detail: 'Không tìm thấy gphoto2.exe trong app (resources/camera-runtime) hoặc PATH', bin: null }
     }
     try {
-      const { stdout } = await execFileAsync(bin, ['--auto-detect'], { timeout: 10000 })
+      const { stdout } = await execFileAsync(bin, ['--auto-detect'], { timeout: 10000, maxBuffer: 1024 * 1024 })
       const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean)
       const cameras = lines.slice(2).filter(l => !/^-+$/.test(l))
-      if (cameras.length === 0) {
-        return { driver: 'gphoto2', connected: false, detail: 'gphoto2 chạy được nhưng chưa thấy máy ảnh qua USB', gphoto2Path: bin }
+      this.detected = cameras.length > 0
+      return {
+        connected: cameras.length > 0,
+        detail: cameras.length > 0 ? `Đã kết nối: ${cameras[0]}` : 'gphoto2 chạy nhưng chưa thấy máy ảnh qua USB',
+        bin,
       }
-      return { driver: 'gphoto2', connected: true, detail: `Đã kết nối: ${cameras[0]}`, gphoto2Path: bin }
     } catch (err: any) {
-      return { driver: 'gphoto2', connected: false, detail: `gphoto2 lỗi: ${String(err?.message ?? err).slice(0, 300)}`, gphoto2Path: bin }
+      this.detected = false
+      return { connected: false, detail: `gphoto2 lỗi: ${String(err?.message ?? err).slice(0, 300)}`, bin }
     }
   }
 
   startLiveView(): void {
     if (this.previewTimer) return
     this.previewTimer = setInterval(() => {
-      if (this.capturing) return // bỏ frame khi đang chụp
-      this.grabPreview().catch(() => { /* bỏ qua frame lỗi */ })
+      if (this.capturing) return
+      this.grabPreview().catch(() => { /* bỏ frame lỗi */ })
     }, 700)
   }
 
@@ -130,17 +134,11 @@ class Gphoto2Camera extends EventEmitter {
     if (!bin) return
     const tmp = path.join(os.tmpdir(), `camrent-preview-${process.pid}.jpg`)
     try {
-      await execFileAsync(bin, ['--capture-preview', '--filename', tmp, '--force-overwrite'], { timeout: 8000, env: gphotoEnv(), cwd: os.tmpdir() })
+      await execFileAsync(bin, ['--capture-preview', '--filename', tmp, '--force-overwrite'], { timeout: 8000, env: gphotoEnv(), cwd: os.tmpdir(), maxBuffer: 8 * 1024 * 1024 })
       const buf = fs.readFileSync(tmp)
       try { fs.unlinkSync(tmp) } catch { /* ignore */ }
-      if (buf.length > 0) {
-        const mime = sniffImageMime(buf)
-        if (mime) {
-          this.emit('frame', `data:${mime};base64,` + buf.toString('base64'))
-        } else {
-          // PPM preview — chưa decode; bỏ frame (Phase 2: decode PPM bằng nativeImage/sharp)
-        }
-      }
+      const mime = sniffImageMime(buf)
+      if (mime) this.emit('frame', `data:${mime};base64,` + buf.toString('base64'))
     } catch {
       try { fs.unlinkSync(tmp) } catch { /* ignore */ }
     }
@@ -153,11 +151,11 @@ class Gphoto2Camera extends EventEmitter {
     this.stopLiveView()
     const tmp = path.join(os.tmpdir(), `camrent-capture-${process.pid}-${Date.now()}.jpg`)
     try {
-      await execFileAsync(bin, ['--capture-image-and-download', '--filename', tmp, '--force-overwrite'], { timeout: 30000, env: gphotoEnv(), cwd: os.tmpdir(), maxBuffer: 4 * 1024 * 1024 })
+      await execFileAsync(bin, ['--capture-image-and-download', '--filename', tmp, '--force-overwrite'], { timeout: 30000, env: gphotoEnv(), cwd: os.tmpdir(), maxBuffer: 8 * 1024 * 1024 })
       const buf = fs.readFileSync(tmp)
       try { fs.unlinkSync(tmp) } catch { /* ignore */ }
       const mime = sniffImageMime(buf)
-      if (!mime) throw new Error('gphoto2 tải ảnh về nhưng không nhận diện được định dạng (PPM?). Phase 2 sẽ decode PPM.')
+      if (!mime) throw new Error('Chụp xong nhưng file không phải JPEG/PNG (có thể là PPM — sẽ decode ở Phase 2). Thử lại.')
       const ext = mime === 'image/png' ? 'png' : 'jpg'
       return { dataUrl: `data:${mime};base64,` + buf.toString('base64'), ext }
     } finally {
@@ -170,16 +168,21 @@ function sniffImageMime(buf: Buffer): string | null {
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
   if (buf.length >= 8 && buf.readUInt32BE(0) === 0x89504e47) return 'image/png'
   if (buf.length >= 6 && buf.slice(0, 6).toString('ascii') === 'GIF87a') return 'image/gif'
-  return null // PPM (P6/P3) & others — chưa hỗ trợ
+  return null
 }
 
 function gphotoEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, CAMLIBS: path.join(path.dirname(findGphoto2() ?? ''), '..', 'camlibs'), IOLIBS: path.join(path.dirname(findGphoto2() ?? ''), '..', 'iolibs') }
+  const bin = findGphoto2()
+  const camlibs = bin ? path.join(path.dirname(bin), '..', 'camlibs') : undefined
+  const iolibs = bin ? path.join(path.dirname(bin), '..', 'iolibs') : undefined
+  return { ...process.env, CAMLIBS: camlibs ?? process.env.CAMLIBS, IOLIBS: iolibs ?? process.env.IOLIBS }
 }
 
 export class CameraService extends EventEmitter {
   private mock = new MockCamera()
   private gphoto = new Gphoto2Camera()
+  private effectiveCache: 'mock' | 'gphoto2' | null = null
+  private resolving: Promise<'mock' | 'gphoto2'> | null = null
 
   constructor() {
     super()
@@ -187,22 +190,61 @@ export class CameraService extends EventEmitter {
     this.gphoto.on('frame', (f: string) => this.emit('frame', f))
   }
 
-  getDriver(): CameraDriver {
-    return (getSetting<string>('cameraDriver', 'mock') as CameraDriver) || 'mock'
+  getDriverSetting(): CameraDriverSetting {
+    const v = (getSetting<string>('cameraDriver', 'auto') as CameraDriverSetting) || 'auto'
+    return v === 'mock' || v === 'gphoto2' ? v : 'auto'
   }
 
-  setDriver(d: CameraDriver): void {
+  setDriver(d: CameraDriverSetting): void {
     this.stopLiveView()
+    this.effectiveCache = null
+    this.gphoto.invalidateCache()
     setSetting('cameraDriver', d)
   }
 
-  async getStatus(): Promise<CameraStatus> {
-    if (this.getDriver() === 'gphoto2') return this.gphoto.status()
-    return { driver: 'mock', connected: true, detail: 'Mock camera — ảnh giả lập (chưa có máy thật)' }
+  private async resolveEffective(): Promise<'mock' | 'gphoto2'> {
+    const setting = this.getDriverSetting()
+    if (setting === 'mock') return 'mock'
+    if (setting === 'gphoto2') return 'gphoto2'
+    // auto — dò 1 lần, cache lại; "Kiểm tra camera" trong Admin sẽ dò lại
+    if (this.effectiveCache) return this.effectiveCache
+    if (!this.resolving) {
+      this.resolving = (async () => {
+        const s = await this.gphoto.status()
+        this.effectiveCache = s.connected ? 'gphoto2' : 'mock'
+        return this.effectiveCache
+      })().finally(() => { this.resolving = null })
+    }
+    return this.resolving
   }
 
-  startLiveView(): void {
-    if (this.getDriver() === 'gphoto2') this.gphoto.startLiveView()
+  async getStatus(): Promise<CameraStatus> {
+    const setting = this.getDriverSetting()
+    if (setting === 'mock') {
+      return { driver: setting, effective: 'mock', connected: true, detail: 'Mock camera — ảnh giả lập' }
+    }
+    if (setting === 'gphoto2') {
+      const s = await this.gphoto.status()
+      if (!s.connected) throw new Error(`gphoto2 chưa sẵn sàng: ${s.detail}`)
+      return { driver: setting, effective: 'gphoto2', connected: true, detail: s.detail, gphoto2Path: s.bin }
+    }
+    // auto
+    this.effectiveCache = null
+    this.gphoto.invalidateCache()
+    const s = await this.gphoto.status()
+    this.effectiveCache = s.connected ? 'gphoto2' : 'mock'
+    return {
+      driver: 'auto',
+      effective: this.effectiveCache,
+      connected: true,
+      detail: s.connected ? s.detail + ' (tự nhận theo USB)' : 'Không thấy camera — đang dùng mock. Cắm máy, bật nguồn, rồi bấm "Kiểm tra camera".',
+      gphoto2Path: s.bin,
+    }
+  }
+
+  async startLiveView(): Promise<void> {
+    const effective = await this.resolveEffective()
+    if (effective === 'gphoto2') this.gphoto.startLiveView()
     else this.mock.startLiveView()
   }
 
@@ -212,7 +254,13 @@ export class CameraService extends EventEmitter {
   }
 
   async capture(): Promise<{ dataUrl: string; ext: string }> {
-    if (this.getDriver() === 'gphoto2') return this.gphoto.capture()
+    const effective = await this.resolveEffective()
+    if (effective === 'gphoto2') return this.gphoto.capture()
+    if (this.getDriverSetting() === 'gphoto2') {
+      // gphoto2 bắt buộc nhưng chưa kết nối — lỗi rõ ràng
+      const s = await this.gphoto.status()
+      throw new Error(`Không chụp được: ${s.detail}`)
+    }
     return this.mock.capture()
   }
 }
