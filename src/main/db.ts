@@ -69,6 +69,8 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   pricing: { classic4: 30000, strip4: 25000, single: 15000 },
   staffPin: '1234',
   cameraDriver: 'auto',
+  countdownSeconds: 5,
+  shotsPerSession: 4,
   gphoto2Path: '',
   templatePrinters: { classic4: null, strip4: null }, // queue Windows riêng cho từng template (vd khổ 4×6 và strip 2×6)
 }

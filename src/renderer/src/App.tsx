@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useBooth } from './store'
 
 const IPC = {
@@ -82,7 +82,10 @@ function Attract() {
   )
 }
 
-/* ---------------- Camera ---------------- */
+/* ---------------- Camera (auto countdown, porting cơ chế bản gốc) ---------------- */
+const COUNTDOWN_R = 90
+const COUNTDOWN_CIRC = 2 * Math.PI * COUNTDOWN_R
+
 function CameraScreen() {
   const setScreen = useBooth((s) => s.setScreen)
   const addPhoto = useBooth((s) => s.addPhoto)
@@ -92,56 +95,193 @@ function CameraScreen() {
   const [flash, setFlash] = useState(false)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<string>('')
+  const [countdown, setCountdown] = useState<number | null>(null)
+  const [cfg, setCfg] = useState({ countdownSeconds: 5, shotsPerSession: 4 })
 
-  useEffect(() => {
-    window.booth.invoke(IPC.CAMERA_START_LIVE_VIEW)
-    const off = window.booth.on(IPC.CAMERA_LIVE_VIEW_FRAME, (f) => setLiveFrame(f as string))
-    window.booth.invoke(IPC.CAMERA_STATUS).then((s: any) => setStatus(`${s.driver}: ${s.detail}`))
-    return () => {
-      off()
-      window.booth.invoke(IPC.CAMERA_STOP_LIVE_VIEW)
-    }
-  }, [])
+  const genRef = useRef(0)
+  const startedRef = useRef(false)
+  const countRef = useRef(0)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cfgRef = useRef(cfg)
+  const audioRef = useRef<AudioContext | null>(null)
+  cfgRef.current = cfg
 
-  const shoot = async () => {
-    if (busy || photos.length >= 10) return
+  const beep = (freq: number, dur: number, type: OscillatorType = 'sine', vol = 0.25, delay = 0) => {
+    try {
+      const ctx = (audioRef.current ??= new (window.AudioContext || (window as any).webkitAudioContext)())
+      if (ctx.state === 'suspended') void ctx.resume()
+      const t0 = ctx.currentTime + delay
+      const o = ctx.createOscillator()
+      const g = ctx.createGain()
+      o.type = type
+      o.frequency.value = freq
+      o.connect(g)
+      g.connect(ctx.destination)
+      g.gain.setValueAtTime(0, t0)
+      g.gain.linearRampToValueAtTime(vol, t0 + 0.01)
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + dur)
+      o.start(t0)
+      o.stop(t0 + dur + 0.05)
+    } catch { /* audio optional */ }
+  }
+
+  const clearTimer = () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null } }
+
+  const doCapture = useCallback(async (gen: number) => {
+    if (gen !== genRef.current) return
+    if (countRef.current >= cfgRef.current.shotsPerSession) return
     setBusy(true)
     setFlash(true)
-    setTimeout(() => setFlash(false), 220)
+    beep(1320, 0.15, 'sine', 0.3)
+    window.setTimeout(() => setFlash(false), 180)
     try {
       const r = await window.booth.invoke(IPC.CAMERA_CAPTURE)
+      if (gen !== genRef.current) return
+      countRef.current += 1
       addPhoto({ id: r.photoId, dataUrl: r.dataUrl })
       setSession(r.sessionId)
+      if (countRef.current >= cfgRef.current.shotsPerSession) {
+        window.booth.invoke(IPC.CAMERA_STOP_LIVE_VIEW)
+        setScreen('review')
+        return
+      }
+      // Lượt tiếp theo sau 1.4s — đủ thời gian khách ngắm
+      timerRef.current = setTimeout(() => startCountdown(gen), 1400)
     } finally {
       setBusy(false)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const startCountdown = useCallback((gen: number) => {
+    if (gen !== genRef.current) return
+    clearTimer()
+    const total = Math.max(1, cfgRef.current.countdownSeconds)
+    setCountdown(total)
+    beep(880, 0.1, 'sine', 0.2)
+    let remaining = total
+    const tick = () => {
+      if (gen !== genRef.current) return
+      remaining -= 1
+      setCountdown(remaining)
+      if (remaining > 0) {
+        beep(880, 0.1, 'sine', 0.2)
+        timerRef.current = setTimeout(tick, 1000)
+      } else {
+        setCountdown(null)
+        void doCapture(gen)
+      }
+    }
+    timerRef.current = setTimeout(tick, 1000)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const gen = ++genRef.current
+    countRef.current = 0
+    startedRef.current = false
+    window.booth.invoke(IPC.CAMERA_START_LIVE_VIEW)
+    window.booth.invoke(IPC.CAMERA_STATUS).then((s: any) => setStatus(`${s.effective ?? s.driver}: ${s.detail}`))
+    window.booth.invoke('config:getBoothConfig').then((c: any) => {
+      if (c) setCfg({ countdownSeconds: Number(c.countdownSeconds ?? 5) || 5, shotsPerSession: Math.max(1, Number(c.shotsPerSession ?? 4) || 4) })
+    })
+    const off = window.booth.on(IPC.CAMERA_LIVE_VIEW_FRAME, (f) => {
+      setLiveFrame(f as string)
+      if (!startedRef.current) {
+        startedRef.current = true
+        timerRef.current = setTimeout(() => startCountdown(gen), 800)
+      }
+    })
+    return () => {
+      genRef.current += 1
+      clearTimer()
+      off()
+      window.booth.invoke(IPC.CAMERA_STOP_LIVE_VIEW)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const tapSkip = () => {
+    if (busy) return
+    clearTimer()
+    setCountdown(null)
+    void doCapture(genRef.current)
   }
+
+  const progress = countdown !== null ? countdown / Math.max(1, cfg.countdownSeconds) : 0
+  const total = cfg.shotsPerSession
 
   return (
     <div className="flex h-full flex-col bg-black">
       <div className="flex items-center justify-between px-6 py-3">
         <button className="btn-ghost !py-2" onClick={() => setScreen('attract')}>← Thoát</button>
-        <div className="text-lg text-white/70">{photos.length} ảnh đã chụp · tối đa 10</div>
+        <div className="flex items-center gap-3">
+          {Array.from({ length: total }).map((_, i) => (
+            <span
+              key={i}
+              className="block h-2 w-10 rounded-full transition-all duration-500"
+              style={{
+                background:
+                  i < photos.length ? 'linear-gradient(90deg,#ec4899,#f472b6)' : i === photos.length ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.18)',
+              }}
+            />
+          ))}
+          <span className="text-lg font-bold text-white">Ảnh {Math.min(photos.length + 1, total)} / {total}</span>
+        </div>
         <div className="text-xs text-white/40">{status}</div>
       </div>
+
       <div className="relative flex flex-1 items-center justify-center overflow-hidden">
         {liveFrame && <img src={liveFrame} alt="Live view" className="h-full w-full object-cover" />}
+        <div className="absolute inset-0" style={{ background: 'linear-gradient(to bottom, rgba(10,7,24,0.55) 0%, transparent 30%, transparent 62%, rgba(10,7,24,0.75) 100%)' }} />
         {flash && <div className="absolute inset-0 bg-white" />}
-        <button
-          aria-label="Chụp ảnh"
-          className="absolute bottom-8 h-24 w-24 rounded-full border-8 border-white bg-red-600 shadow-2xl transition hover:scale-105 active:scale-95"
-          onClick={shoot}
-          disabled={busy}
-        />
+
+        {/* Countdown ring — porting bản gốc (SVG r=90, strokeDashoffset) */}
+        {countdown !== null && countdown > 0 && (
+          <button className="absolute z-10 flex h-64 w-64 items-center justify-center" onClick={tapSkip} aria-label="Chụp ngay">
+            <svg width="240" height="240" viewBox="0 0 240 240" style={{ transform: 'rotate(-90deg)' }}>
+              <defs>
+                <linearGradient id="cd-grad" x1="0" y1="0" x2="1" y2="0">
+                  <stop offset="0" stopColor="#ec4899" />
+                  <stop offset="0.5" stopColor="#f472b6" />
+                  <stop offset="1" stopColor="#db2777" />
+                </linearGradient>
+              </defs>
+              <circle cx="120" cy="120" r={COUNTDOWN_R} fill="none" stroke="rgba(255,255,255,0.10)" strokeWidth="6" />
+              <circle
+                cx="120"
+                cy="120"
+                r={COUNTDOWN_R}
+                fill="none"
+                stroke="url(#cd-grad)"
+                strokeWidth="6"
+                strokeLinecap="round"
+                strokeDasharray={COUNTDOWN_CIRC}
+                strokeDashoffset={COUNTDOWN_CIRC * (1 - progress)}
+                style={{ transition: 'stroke-dashoffset 0.9s linear' }}
+              />
+            </svg>
+            <div className="absolute flex flex-col items-center">
+              <span className="font-black leading-none text-pink-500" style={{ fontSize: '7rem', textShadow: '0 0 18px rgba(236,72,153,0.35)' }}>
+                {countdown}
+              </span>
+            </div>
+          </button>
+        )}
+        {busy && (
+          <div className="absolute bottom-28 z-10 rounded-full bg-black/70 px-6 py-2 text-lg font-bold text-amber-300">Đang chụp…</div>
+        )}
       </div>
+
       <div className="flex gap-3 overflow-x-auto border-t border-white/10 p-4">
         {photos.map((p) => (
           <img key={p.id} src={p.dataUrl} className="h-24 w-32 rounded-lg object-cover" alt="thumb" />
         ))}
         <div className="flex-1" />
-        <button className="btn-primary self-center !text-xl" onClick={() => photos.length > 0 && setScreen('review')}>
-          Xong →
-        </button>
+        <div className="flex flex-col items-end gap-2 self-center">
+          <button className="btn-primary !py-3 !text-lg" onClick={tapSkip} disabled={busy || photos.length >= total}>Chụp ngay</button>
+          <button className="btn-ghost !py-2 !text-sm" onClick={() => photos.length > 0 && setScreen('review')}>Xong →</button>
+        </div>
       </div>
     </div>
   )
@@ -429,6 +569,10 @@ function Admin() {
           <h3 className="mb-2 text-xl font-semibold">Thông tin booth</h3>
           <label className="mb-2 block text-sm text-white/60">Tên booth<input className="mt-1 w-full rounded-lg border border-white/20 bg-white/5 px-3 py-2" value={cfg.boothName} onChange={(e) => setCfg({ ...cfg, boothName: e.target.value })} /></label>
           <label className="mb-2 block text-sm text-white/60">Cổng chia sẻ (LAN)<input type="number" className="mt-1 w-full rounded-lg border border-white/20 bg-white/5 px-3 py-2" value={cfg.sharesPort} onChange={(e) => setCfg({ ...cfg, sharesPort: Number(e.target.value) })} /></label>
+          <div className="mb-2 grid grid-cols-2 gap-3">
+            <label className="block text-sm text-white/60">Countdown (giây)<input type="number" min={1} max={30} className="mt-1 w-full rounded-lg border border-white/20 bg-white/5 px-3 py-2" value={cfg.countdownSeconds ?? 5} onChange={(e) => setCfg({ ...cfg, countdownSeconds: Number(e.target.value) })} /></label>
+            <label className="block text-sm text-white/60">Số ảnh / phiên<input type="number" min={1} max={10} className="mt-1 w-full rounded-lg border border-white/20 bg-white/5 px-3 py-2" value={cfg.shotsPerSession ?? 4} onChange={(e) => setCfg({ ...cfg, shotsPerSession: Number(e.target.value) })} /></label>
+          </div>
           <label className="mb-2 block text-sm text-white/60">Máy in mặc định
             <select className="mt-1 w-full rounded-lg border border-white/20 bg-white/5 px-3 py-2" value={cfg.defaultPrinter ?? ''} onChange={(e) => setCfg({ ...cfg, defaultPrinter: e.target.value || null })}>
               <option value="">— Chọn —</option>

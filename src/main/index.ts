@@ -199,11 +199,13 @@ ipcMain.handle(IPC.CONFIG_GET_BOOTH_CONFIG, () => ({
   defaultPrinter: getSetting<string | null>('defaultPrinter', null),
   templatePrinters: getSetting<Record<string, string | null>>('templatePrinters', {}),
   staffPinSet: !!getSetting<string>('staffPin', ''),
-  cameraDriver: getSetting<string>('cameraDriver', 'mock'),
+  cameraDriver: getSetting<string>('cameraDriver', 'auto'),
   gphoto2Path: getSetting<string>('gphoto2Path', ''),
+  countdownSeconds: getSetting<number>('countdownSeconds', 5),
+  shotsPerSession: getSetting<number>('shotsPerSession', 4),
 }))
 ipcMain.handle(IPC.CONFIG_SAVE_BOOTH_CONFIG, (_e, arg: Record<string, unknown>) => {
-  for (const k of ['boothName', 'pricing', 'currency', 'sharesPort', 'defaultPrinter', 'templatePrinters', 'cameraDriver', 'gphoto2Path'] as const) {
+  for (const k of ['boothName', 'pricing', 'currency', 'sharesPort', 'defaultPrinter', 'templatePrinters', 'cameraDriver', 'gphoto2Path', 'countdownSeconds', 'shotsPerSession'] as const) {
     if (arg && k in arg) setSetting(k, (arg as Record<string, unknown>)[k])
   }
   return { ok: true }
